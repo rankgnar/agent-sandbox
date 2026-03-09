@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# sandbox - Linux-native sandboxing for AI coding agents
+# Uses bubblewrap (bwrap) for kernel-level process isolation
+# https://github.com/rankgnar/agent-sandbox
+
+set -euo pipefail
+
+VERSION="0.1.0"
+SCRIPT_NAME="$(basename "$0")"
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ─── Help ─────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+${BOLD}sandbox v${VERSION}${RESET} — Linux-native AI agent sandboxing via bubblewrap
+
+${BOLD}USAGE${RESET}
+  $SCRIPT_NAME [OPTIONS] <command> [args...]
+
+${BOLD}OPTIONS${RESET}
+  --allow-read=<path>     Allow read access to an additional path
+  --allow-write=<path>    Allow read+write access to an additional path
+  --allow-network         Allow outbound network access (default: isolated)
+  --workdir=<path>        Set explicit working directory (default: git root or cwd)
+  --no-git-detect         Disable automatic git root detection
+  --dry-run               Print the bwrap command without executing
+  --version               Show version and exit
+  -h, --help              Show this help
+
+${BOLD}DEFAULTS${RESET}
+  • Working directory (git root or cwd): read + write
+  • /usr, /lib, /lib64, /bin, /sbin: read-only (binaries)
+  • /etc: read-only (system config)
+  • /proc, /dev: minimal virtual mounts
+  • Blocked: ~/.ssh  ~/.aws  ~/.config  ~/.gnupg  /root  /home (other users)
+  • Network: blocked by default (pass --allow-network to enable)
+
+${BOLD}EXAMPLES${RESET}
+  $SCRIPT_NAME claude --dangerously-skip-permissions
+  $SCRIPT_NAME codex --full-auto
+  $SCRIPT_NAME --allow-read=/data/models codex --full-auto
+  $SCRIPT_NAME --allow-network --workdir=/tmp/project bash
+  $SCRIPT_NAME --dry-run claude --dangerously-skip-permissions
+
+${BOLD}REQUIREMENTS${RESET}
+  bubblewrap (bwrap) — install with:
+    Debian/Ubuntu: apt install bubblewrap
+    Fedora/RHEL:   dnf install bubblewrap
+    Arch:          pacman -S bubblewrap
+EOF
+}
+
+# ─── Dependency check ─────────────────────────────────────────────────────────
+check_deps() {
+    if ! command -v bwrap &>/dev/null; then
+        echo -e "${RED}Error: bubblewrap (bwrap) is not installed.${RESET}" >&2
+        echo -e "Install it with:" >&2
+        echo -e "  Debian/Ubuntu: ${CYAN}sudo apt install bubblewrap${RESET}" >&2
+        echo -e "  Fedora/RHEL:   ${CYAN}sudo dnf install bubblewrap${RESET}" >&2
+        echo -e "  Arch:          ${CYAN}sudo pacman -S bubblewrap${RESET}" >&2
+        exit 1
+    fi
+}
+
+# ─── Git root detection ───────────────────────────────────────────────────────
+find_git_root() {
+    local dir
+    dir="$(git rev-parse --show-toplevel 2>/dev/null)" && echo "$dir" || echo ""
+}
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+EXTRA_READS=()
+EXTRA_WRITES=()
+ALLOW_NETWORK=false
+EXPLICIT_WORKDIR=""
+GIT_DETECT=true
+DRY_RUN=false
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --allow-read=*)
+            path="${1#--allow-read=}"
+            EXTRA_READS+=("$(realpath -m "$path")")
+            shift ;;
+        --allow-read)
+            shift
+            EXTRA_READS+=("$(realpath -m "$1")")
+            shift ;;
+        --allow-write=*)
+            path="${1#--allow-write=}"
+            EXTRA_WRITES+=("$(realpath -m "$path")")
+            shift ;;
+        --allow-write)
+            shift
+            EXTRA_WRITES+=("$(realpath -m "$1")")
+            shift ;;
+        --allow-network)
+            ALLOW_NETWORK=true
+            shift ;;
+        --workdir=*)
+            EXPLICIT_WORKDIR="${1#--workdir=}"
+            shift ;;
+        --workdir)
+            shift
+            EXPLICIT_WORKDIR="$1"
+            shift ;;
+        --no-git-detect)
+            GIT_DETECT=false
+            shift ;;
+        --dry-run)
+            DRY_RUN=true
+            shift ;;
+        --version)
+            echo "sandbox v${VERSION}"
+            exit 0 ;;
+        -h|--help)
+            usage
+            exit 0 ;;
+        --)
+            shift
+            POSITIONAL+=("$@")
+            break ;;
+        -*)
+            echo -e "${RED}Unknown option: $1${RESET}" >&2
+            echo "Run '$SCRIPT_NAME --help' for usage." >&2
+            exit 1 ;;
+        *)
+            POSITIONAL+=("$1")
+            shift ;;
+    esac
+done
+
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+# ─── Resolve command ──────────────────────────────────────────────────────────
+CMD="${POSITIONAL[0]}"
+CMD_ARGS=("${POSITIONAL[@]:1}")
+
+# Resolve full path of the command
+CMD_PATH="$(command -v "$CMD" 2>/dev/null || true)"
+if [[ -z "$CMD_PATH" ]]; then
+    echo -e "${RED}Error: command not found: $CMD${RESET}" >&2
+    exit 1
+fi
+
+# ─── Working directory ────────────────────────────────────────────────────────
+if [[ -n "$EXPLICIT_WORKDIR" ]]; then
+    WORKDIR="$(realpath -m "$EXPLICIT_WORKDIR")"
+elif [[ "$GIT_DETECT" == "true" ]]; then
+    GIT_ROOT="$(find_git_root)"
+    if [[ -n "$GIT_ROOT" ]]; then
+        WORKDIR="$GIT_ROOT"
+        echo -e "${GREEN}[sandbox]${RESET} Detected git root: ${BOLD}$WORKDIR${RESET}" >&2
+    else
+        WORKDIR="$(pwd)"
+    fi
+else
+    WORKDIR="$(pwd)"
+fi
+
+echo -e "${GREEN}[sandbox]${RESET} Working directory: ${BOLD}$WORKDIR${RESET}" >&2
+echo -e "${GREEN}[sandbox]${RESET} Running: ${BOLD}$CMD ${CMD_ARGS[*]:-}${RESET}" >&2
+[[ "$ALLOW_NETWORK" == "false" ]] && \
+    echo -e "${YELLOW}[sandbox]${RESET} Network: ${BOLD}isolated${RESET}" >&2 || \
+    echo -e "${YELLOW}[sandbox]${RESET} Network: ${BOLD}allowed${RESET}" >&2
+
+# ─── Build bwrap arguments ────────────────────────────────────────────────────
+BWRAP_ARGS=()
+
+# Minimal /dev
+BWRAP_ARGS+=(--dev /dev)
+
+# Proc
+BWRAP_ARGS+=(--proc /proc)
+
+# Core system paths (read-only)
+for ro_path in /usr /bin /sbin /lib /lib32 /lib64 /libx32; do
+    [[ -e "$ro_path" ]] && BWRAP_ARGS+=(--ro-bind "$ro_path" "$ro_path")
+done
+
+# /etc read-only (needed for resolv.conf, nsswitch, etc.)
+BWRAP_ARGS+=(--ro-bind /etc /etc)
+
+# Temporary directory
+BWRAP_ARGS+=(--tmpfs /tmp)
+
+# /run (needed by many tools for sockets)
+BWRAP_ARGS+=(--tmpfs /run)
+
+# /home as tmpfs (block all home dirs by default)
+BWRAP_ARGS+=(--tmpfs /home)
+
+# /root as tmpfs (block root home)
+BWRAP_ARGS+=(--tmpfs /root)
+
+# Expose working directory with read+write
+if [[ ! -d "$WORKDIR" ]]; then
+    mkdir -p "$WORKDIR"
+fi
+BWRAP_ARGS+=(--bind "$WORKDIR" "$WORKDIR")
+
+# Extra read-only mounts
+for p in "${EXTRA_READS[@]}"; do
+    if [[ -e "$p" ]]; then
+        BWRAP_ARGS+=(--ro-bind "$p" "$p")
+        echo -e "${GREEN}[sandbox]${RESET} +read: $p" >&2
+    else
+        echo -e "${YELLOW}[sandbox]${RESET} Warning: --allow-read path not found: $p" >&2
+    fi
+done
+
+# Extra read+write mounts
+for p in "${EXTRA_WRITES[@]}"; do
+    if [[ ! -e "$p" ]]; then
+        mkdir -p "$p"
+    fi
+    BWRAP_ARGS+=(--bind "$p" "$p")
+    echo -e "${GREEN}[sandbox]${RESET} +write: $p" >&2
+done
+
+# Mount the command itself (if outside system paths)
+# System paths already covered above; no extra mount needed for /usr/bin etc.
+
+# Expose current user info to avoid "unknown user" errors in tools
+# We expose /etc/passwd and /etc/group read-only (already in /etc above).
+
+# HOME inside sandbox = workdir
+BWRAP_ARGS+=(--setenv HOME "$WORKDIR")
+BWRAP_ARGS+=(--setenv USER "${USER:-sandbox}")
+BWRAP_ARGS+=(--setenv LOGNAME "${LOGNAME:-sandbox}")
+
+# PATH inside sandbox
+BWRAP_ARGS+=(--setenv PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
+# Forward useful env vars (non-sensitive)
+for var in TERM COLORTERM LANG LC_ALL ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY; do
+    [[ -n "${!var:-}" ]] && BWRAP_ARGS+=(--setenv "$var" "${!var}")
+done
+
+# Working directory inside sandbox
+BWRAP_ARGS+=(--chdir "$WORKDIR")
+
+# Unshare namespaces
+BWRAP_ARGS+=(--unshare-pid)
+BWRAP_ARGS+=(--unshare-uts)
+BWRAP_ARGS+=(--unshare-ipc)
+BWRAP_ARGS+=(--unshare-cgroup-try)
+
+# Network isolation
+if [[ "$ALLOW_NETWORK" == "false" ]]; then
+    BWRAP_ARGS+=(--unshare-net)
+else
+    # Need /etc/resolv.conf for DNS (already covered by /etc bind above)
+    :
+fi
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+FULL_CMD=(bwrap "${BWRAP_ARGS[@]}" -- "$CMD_PATH" "${CMD_ARGS[@]}")
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo -e "\n${CYAN}[sandbox dry-run] Command:${RESET}"
+    printf '%q ' "${FULL_CMD[@]}"
+    echo
+    exit 0
+fi
+
+exec "${FULL_CMD[@]}"
