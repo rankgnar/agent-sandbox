@@ -1,5 +1,7 @@
 # agent-sandbox 🏗️
 
+![banner](assets/banner.jpg)
+
 > Linux-native sandboxing for AI coding agents.  
 > Run Codex, Claude Code, Gemini CLI, and other agents safely — isolated at the kernel level using **bubblewrap (bwrap)**.
 
